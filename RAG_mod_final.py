@@ -13,6 +13,10 @@ import json
 import sqlite3
 from contextlib import contextmanager
 from llama_cpp import Llama
+from sentence_transformers import SentenceTransformer
+import faiss
+import pickle
+import numpy as np
 
 app = FastAPI()
 
@@ -32,6 +36,7 @@ class Message(BaseModel):
     role: str  # "user" or "assistant"
     content: str
     timestamp: str = None
+    response_type: str = "regular"  # "regular" or "rag"
 
 class Conversation(BaseModel):
     id: str
@@ -44,11 +49,13 @@ class PromptRequest(BaseModel):
     prompt: str
     conversation_id: Optional[str] = None
     title: Optional[str] = None
+    use_rag: bool = False  # New field to specify RAG or regular response
 
 class ConversationResponse(BaseModel):
     response: str
     conversation_id: str
     title: str
+    response_type: str  # "regular" or "rag"
 
 class ConversationListItem(BaseModel):
     id: str
@@ -57,8 +64,12 @@ class ConversationListItem(BaseModel):
     updated_at: str
     preview: str  # First few characters of the first message
 
-# Global model instance - load once and reuse
+# Global model instances
 model = None
+rag_model = None
+embedding_model = None
+faiss_index = None
+text_chunks = None
 
 # Request queue for handling concurrent requests
 request_queue = queue.Queue()
@@ -68,7 +79,12 @@ response_dict = {}
 response_lock = threading.Lock()
 
 # Maximum number of previous exchanges to remember
-MAX_HISTORY = 5  # This means 5 pairs of user/assistant messages
+MAX_HISTORY = 5
+
+# RAG configuration
+INDEX_PATH = "company_docs/index.faiss"
+CHUNKS_PATH = "company_docs/chunks.pkl"
+EMBED_MODEL = 'all-MiniLM-L6-v2'
 
 # Database setup functions
 def init_db():
@@ -86,7 +102,7 @@ def init_db():
         )
         ''')
         
-        # Create messages table
+        # Create messages table with response_type column
         cursor.execute('''
         CREATE TABLE IF NOT EXISTS messages (
             id TEXT PRIMARY KEY,
@@ -94,9 +110,16 @@ def init_db():
             role TEXT NOT NULL,
             content TEXT NOT NULL,
             timestamp TEXT NOT NULL,
+            response_type TEXT DEFAULT 'regular',
             FOREIGN KEY (conversation_id) REFERENCES conversations (id)
         )
         ''')
+        
+        # Add response_type column if it doesn't exist (for existing databases)
+        try:
+            cursor.execute('ALTER TABLE messages ADD COLUMN response_type TEXT DEFAULT "regular"')
+        except sqlite3.OperationalError:
+            pass  # Column already exists
         
         conn.commit()
 
@@ -104,7 +127,7 @@ def init_db():
 def get_db_connection():
     """Context manager for database connections"""
     conn = sqlite3.connect(DATABASE_FILE)
-    conn.row_factory = sqlite3.Row  # This enables column access by name
+    conn.row_factory = sqlite3.Row
     try:
         yield conn
     finally:
@@ -127,14 +150,20 @@ def get_conversation_from_db(conversation_id: str) -> Optional[Conversation]:
             
         # Get messages for this conversation
         cursor.execute(
-            "SELECT role, content, timestamp FROM messages WHERE conversation_id = ? ORDER BY timestamp ASC", 
+            "SELECT role, content, timestamp, response_type FROM messages WHERE conversation_id = ? ORDER BY timestamp ASC", 
             (conversation_id,)
         )
         
         message_rows = cursor.fetchall()
-        messages = [Message(role=row['role'], content=row['content'], timestamp=row['timestamp']) for row in message_rows]
+        messages = [
+            Message(
+                role=row['role'], 
+                content=row['content'], 
+                timestamp=row['timestamp'],
+                response_type=row['response_type'] if 'response_type' in row.keys() else 'regular'
+            ) for row in message_rows
+        ]
         
-        # Construct and return the conversation object
         return Conversation(
             id=conversation_row['id'],
             title=conversation_row['title'],
@@ -147,7 +176,6 @@ def save_conversation_to_db(conversation: Conversation):
     """Save a conversation to the database"""
     now = datetime.datetime.utcnow().isoformat()
     
-    # Set timestamps if not already set
     if not conversation.created_at:
         conversation.created_at = now
     conversation.updated_at = now
@@ -169,7 +197,6 @@ def save_conversation_to_db(conversation: Conversation):
             if not message.timestamp:
                 message.timestamp = now
             
-            # Check if this message already exists
             cursor.execute(
                 """
                 SELECT id FROM messages 
@@ -181,13 +208,13 @@ def save_conversation_to_db(conversation: Conversation):
             existing_message = cursor.fetchone()
             
             if not existing_message:
-                # Insert the new message
                 cursor.execute(
                     """
-                    INSERT INTO messages (id, conversation_id, role, content, timestamp)
-                    VALUES (?, ?, ?, ?, ?)
+                    INSERT INTO messages (id, conversation_id, role, content, timestamp, response_type)
+                    VALUES (?, ?, ?, ?, ?, ?)
                     """,
-                    (str(uuid.uuid4()), conversation.id, message.role, message.content, message.timestamp)
+                    (str(uuid.uuid4()), conversation.id, message.role, 
+                     message.content, message.timestamp, message.response_type)
                 )
         
         conn.commit()
@@ -197,7 +224,6 @@ def get_all_conversations():
     with get_db_connection() as conn:
         cursor = conn.cursor()
         
-        # Get all conversations
         cursor.execute("""
             SELECT c.id, c.title, c.created_at, c.updated_at, 
                    (SELECT content FROM messages 
@@ -230,84 +256,130 @@ def delete_conversation(conversation_id: str):
     with get_db_connection() as conn:
         cursor = conn.cursor()
         
-        # Delete messages first (foreign key constraint)
         cursor.execute("DELETE FROM messages WHERE conversation_id = ?", (conversation_id,))
-        
-        # Delete the conversation
         cursor.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
         
         conn.commit()
-        
-        return cursor.rowcount > 0  # Return True if conversation was deleted
-
+        return cursor.rowcount > 0
 def initialize_model():
-    """Initialize the LLM model once at startup"""
+    """Initialize the regular LLM model"""
     global model
-
-    # Update to use TinyLlama model path in the rag-chatbot directory
-    model_path = os.path.join(os.path.dirname(__file__), "llama.cpp/models/mistral-7b-instruct-v0.1.Q4_K_M.gguf")
-
-    # Check if model file exists
+    
+    model_path = os.path.join(os.path.dirname(__file__), "llama.cpp/models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf")
+    
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Model file not found at: {model_path}")
-
-    print(f"Loading TinyLlama model from {model_path}...")
-
-    # Load the model with parameters optimized for TinyLlama
+    
+    print(f"Loading Deepseek model from {model_path}...")
+    
     model = Llama(
         model_path=model_path,
-        n_ctx=4096,        # TinyLlama can handle decent context
-        n_batch=512,       # Batch size for prompt processing
-        n_threads=4,       # CPU threads, adjust based on your system
-        n_gpu_layers=0,    # Set to higher value if you have a compatible GPU 
-        verbose=False      # Set to True for debugging
+        n_ctx=4096,
+        n_batch=512,
+        n_threads=4,
+        n_gpu_layers=0,
+        verbose=False
     )
+    
+    print("Deepseek model loaded successfully!")
 
-    print("TinyLlama model loaded successfully!")
+def initialize_rag_system():
+    """Initialize the RAG system components"""
+    global rag_model, embedding_model, faiss_index, text_chunks
+    
+    try:
+        # Use the same model for RAG
+        rag_model_path = os.path.join(os.path.dirname(__file__), "llama.cpp/models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf")
+        
+        if os.path.exists(rag_model_path):
+            print(f"Loading RAG model from {rag_model_path}...")
+            rag_model = Llama(model_path=rag_model_path, n_ctx=2048, n_threads=8)
+            print("RAG model loaded successfully!")
+        else:
+            print(f"RAG model not found at {rag_model_path}, RAG features will be disabled")
+            return
+        
+        # Load embedding model and FAISS index as before
+        if os.path.exists(INDEX_PATH) and os.path.exists(CHUNKS_PATH):
+            print("Loading RAG components...")
+            embedding_model = SentenceTransformer(EMBED_MODEL)
+            faiss_index = faiss.read_index(INDEX_PATH)
+            with open(CHUNKS_PATH, "rb") as f:
+                text_chunks = pickle.load(f)
+            print("RAG components loaded successfully!")
+        else:
+            print(f"RAG index files not found at {INDEX_PATH} or {CHUNKS_PATH}, RAG features will be disabled")
+            
+    except Exception as e:
+        print(f"Error initializing RAG system: {e}")
+        rag_model = None
+        embedding_model = None
+        faiss_index = None
+        text_chunks = None
+
+def retrieve_context(query: str, top_k: int = 5):
+    """Retrieve relevant context for RAG"""
+    if not all([embedding_model, faiss_index, text_chunks]):
+        return []
+    
+    try:
+        query_vec = embedding_model.encode([query])
+        D, I = faiss_index.search(np.array(query_vec), top_k)
+        return [text_chunks[i] for i in I[0]]
+    except Exception as e:
+        print(f"Error retrieving context: {e}")
+        return []
 
 def inference_worker():
     """Worker thread that processes requests from the queue"""
     while True:
         try:
-            # Get request from queue
-            request_id, prompt, max_tokens, conversation_id, title = request_queue.get()
+            request_id, prompt, max_tokens, conversation_id, title, use_rag = request_queue.get()
             
-            # Process with model
-            output = model(
-                prompt,
-                max_tokens=max_tokens,
-                stop=["User:", "\n\nUser:", "<|im_end|>", "<|endoftext|>"],  # Stop tokens for TinyLlama
-                echo=False,
-                temperature=0.7,  # Good balance for chat
-                repeat_penalty=1.15  # Slightly increased for TinyLlama which can be repetitive
-            )
+            if use_rag and rag_model:
+                # Use RAG model
+                output = rag_model(
+                    prompt,
+                    max_tokens=max_tokens,
+                    stop=["<|im_end|>"],
+                    echo=False,
+                    temperature=0.7
+                )
+                response_type = "rag"
+            else:
+                # Use regular model
+                output = model(
+                    prompt,
+                    max_tokens=max_tokens,
+                    stop=["User:", "\n\nUser:", "<|im_end|>", "<|endoftext|>"],
+                    echo=False,
+                    temperature=0.7,
+                    repeat_penalty=1.15
+                )
+                response_type = "regular"
             
-            # Extract the response
             response_text = output["choices"][0]["text"].strip()
             
-            # Store the result
             with response_lock:
-                response_dict[request_id] = (response_text, conversation_id, title)
+                response_dict[request_id] = (response_text, conversation_id, title, response_type)
             
-            # Mark task as done
             request_queue.task_done()
             
         except Exception as e:
             print(f"Error in inference worker: {str(e)}")
             with response_lock:
-                response_dict[request_id] = (f"Error: {str(e)}", conversation_id, None)
+                response_dict[request_id] = (f"Error: {str(e)}", conversation_id, None, "error")
             request_queue.task_done()
 
 @app.on_event("startup")
 async def startup_event():
-    """Initialize model, database and start worker threads on application startup"""
+    """Initialize models, database and start worker threads on application startup"""
     try:
-        # Initialize the database
         init_db()
         print("Database initialized successfully!")
         
-        # Initialize the model
         initialize_model()
+        initialize_rag_system()
         
         # Start worker thread
         worker_thread = threading.Thread(target=inference_worker, daemon=True)
@@ -315,14 +387,12 @@ async def startup_event():
         
     except Exception as e:
         print(f"Error during startup: {str(e)}")
-        # Don't raise exception here, let the app start and handle errors in endpoints
 
 @app.post("/ask", response_model=ConversationResponse)
 async def ask(request: PromptRequest, background_tasks: BackgroundTasks):
-    # Print request for debugging
     print(f"Received request: {request}")
     
-    # Ensure model is loaded
+    # Ensure at least the regular model is loaded
     global model
     if model is None:
         try:
@@ -330,93 +400,101 @@ async def ask(request: PromptRequest, background_tasks: BackgroundTasks):
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to initialize model: {str(e)}")
     
+    # Check if RAG is requested but not available
+    if request.use_rag and not rag_model:
+        raise HTTPException(status_code=400, detail="RAG model not available")
+    
     # Get or create conversation
     conversation_id = request.conversation_id
     conversation = None
     
     if conversation_id:
         conversation = get_conversation_from_db(conversation_id)
-        print(f"Retrieved conversation: {conversation}")
     
     if not conversation:
-        # Create new conversation
         conversation_id = str(uuid.uuid4())
         conversation = Conversation(
             id=conversation_id,
             title=request.title or "New conversation",
             messages=[]
         )
-        print(f"Created new conversation with ID: {conversation_id}")
     else:
-        print(f"Using existing conversation with ID: {conversation_id}")
-        # Update title if provided
         if request.title:
             conversation.title = request.title
     
     # Add user message to history
     now = datetime.datetime.utcnow().isoformat()
-    new_message = Message(role="user", content=request.prompt, timestamp=now)
+    new_message = Message(
+        role="user", 
+        content=request.prompt, 
+        timestamp=now,
+        response_type="regular"  # User messages are always regular
+    )
     conversation.messages.append(new_message)
     
-    # Save conversation with the new user message
     save_conversation_to_db(conversation)
     
-    # Format prompt for TinyLlama Chat
-    # TinyLlama chat versions were fine-tuned on the Alpaca-LoRA format
-    system_prompt = "<|im_start|>system\nYou are a helpful AI assistant. You provide accurate, helpful and detailed responses.<|im_end|>"
-    
-    # Build conversation history in the format TinyLlama expects
-    conversation_parts = [system_prompt]
-    
-    # Add relevant history - use the full history
-    relevant_history = conversation.messages[-MAX_HISTORY*2:] if len(conversation.messages) > 1 else []
-    
-    if relevant_history:
-        for msg in relevant_history:
-            if msg.role == "user":
-                conversation_parts.append(f"<|im_start|>user\n{msg.content}<|im_end|>")
-            else:
-                conversation_parts.append(f"<|im_start|>assistant\n{msg.content}<|im_end|>")
-    else:
-        # Just add the current user message if no history
-        conversation_parts.append(f"<|im_start|>user\n{request.prompt}<|im_end|>")
+    # Format prompt based on whether RAG is used
+    if request.use_rag and rag_model:
+        # RAG prompt formatting
+        context_chunks = retrieve_context(request.prompt)
+        context_block = "\n".join(context_chunks)
         
-    # Add the assistant prompt to generate the response
-    conversation_parts.append("<|im_start|>assistant")
-    
-    # Join all parts to create the full prompt
-    full_prompt = "\n".join(conversation_parts)
-    
-    print(f"Full prompt length: {len(full_prompt)} characters")
+        full_prompt = f"""
+<|im_start|>system
+You are a helpful assistant with access to company knowledge. Use the context below to help answer the user's question.
+
+Context:
+{context_block}
+<|im_end|>
+<|im_start|>user
+{request.prompt}<|im_end|>
+<|im_start|>assistant
+"""
+    else:
+        # Regular prompt formatting
+        system_prompt = "<|im_start|>system\nYou are a helpful AI assistant. You provide accurate, helpful and detailed responses.<|im_end|>"
+        
+        conversation_parts = [system_prompt]
+        
+        relevant_history = conversation.messages[-MAX_HISTORY*2:] if len(conversation.messages) > 1 else []
+        
+        if relevant_history:
+            for msg in relevant_history:
+                if msg.role == "user":
+                    conversation_parts.append(f"<|im_start|>user\n{msg.content}<|im_end|>")
+                else:
+                    conversation_parts.append(f"<|im_start|>assistant\n{msg.content}<|im_end|>")
+        else:
+            conversation_parts.append(f"<|im_start|>user\n{request.prompt}<|im_end|>")
+            
+        conversation_parts.append("<|im_start|>assistant")
+        full_prompt = "\n".join(conversation_parts)
     
     try:
-        # Generate unique request ID
         request_id = str(uuid.uuid4())
         
         # Submit request to queue
-        request_queue.put((request_id, full_prompt, 1024, conversation_id, conversation.title))
+        request_queue.put((request_id, full_prompt, 1024, conversation_id, conversation.title, request.use_rag))
         
         # Poll for result
-        max_retries = 60  # 30 seconds with 0.5s sleep
+        max_retries = 60
         for _ in range(max_retries):
             with response_lock:
                 if request_id in response_dict:
-                    response_text, conv_id, title = response_dict.pop(request_id)
+                    response_text, conv_id, title, response_type = response_dict.pop(request_id)
                     
-                    # Get updated conversation from DB (it might have changed)
                     conversation = get_conversation_from_db(conv_id)
                     if not conversation:
-                        # If conversation got deleted during processing, create a new one
                         conversation = Conversation(
                             id=conv_id,
                             title=title or "New conversation",
                             messages=[]
                         )
                     
-                    # Auto-generate title from first user message if not already set
+                    # Auto-generate title if needed
                     if conversation.title == "New conversation" and len(conversation.messages) == 1:
                         first_msg = conversation.messages[0].content
-                        # Create a title from the first 5-6 words
                         title_words = first_msg.split()[:6]
                         auto_title = " ".join(title_words)
                         if len(auto_title) > 30:
@@ -425,56 +503,56 @@ async def ask(request: PromptRequest, background_tasks: BackgroundTasks):
                     
                     # Add assistant response to conversation history
                     now = datetime.datetime.utcnow().isoformat()
-                    new_response = Message(role="assistant", content=response_text, timestamp=now)
+                    new_response = Message(
+                        role="assistant", 
+                        content=response_text, 
+                        timestamp=now,
+                        response_type=response_type
+                    )
                     conversation.messages.append(new_response)
                     
-                    # Save updated conversation to DB
                     save_conversation_to_db(conversation)
                     
                     return {
                         "response": response_text,
                         "conversation_id": conversation_id,
-                        "title": conversation.title
+                        "title": conversation.title,
+                        "response_type": response_type
                     }
             
-            # Wait a bit before checking again
             time.sleep(0.5)
         
-        # If we reach here, the request timed out
+        # Timeout
         return {
             "response": "⏱️ Request timed out. The model may be busy processing other requests.",
             "conversation_id": conversation_id,
-            "title": conversation.title if conversation else "New conversation"
+            "title": conversation.title if conversation else "New conversation",
+            "response_type": "error"
         }
         
     except Exception as e:
         import traceback
         traceback.print_exc()
         error_message = f"Error: {str(e)}"
-        print(error_message)
         return {
             "response": f"❌ {error_message}",
             "conversation_id": conversation_id,
-            "title": conversation.title if conversation else "New conversation"
+            "title": conversation.title if conversation else "New conversation",
+            "response_type": "error"
         }
 
-# Endpoint to get conversation history
+# All other endpoints remain the same...
 @app.get("/conversation/{conversation_id}")
 async def get_conversation(conversation_id: str):
     conversation = get_conversation_from_db(conversation_id)
     if conversation:
-        print(f"Retrieved conversation: {conversation}")
         return conversation
     raise HTTPException(status_code=404, detail="Conversation not found")
 
-# Endpoint to get all conversations (for sidebar)
 @app.get("/conversations")
 async def list_conversations():
-    conversations = get_all_conversations()
-    print(f"Retrieved {len(conversations)} conversations")
-    return conversations
+    return get_all_conversations()
 
-# Endpoint to update conversation title
 @app.post("/conversation/{conversation_id}/title")
 async def update_conversation_title(conversation_id: str, title: str):
     conversation = get_conversation_from_db(conversation_id)
@@ -485,24 +563,19 @@ async def update_conversation_title(conversation_id: str, title: str):
     save_conversation_to_db(conversation)
     return {"status": "Title updated"}
 
-# Endpoint to reset/clear a conversation
 @app.post("/conversation/{conversation_id}/reset")
 async def reset_conversation(conversation_id: str):
-    # Delete the old conversation and create a new one with the same ID
     conversation = get_conversation_from_db(conversation_id)
     if not conversation:
         raise HTTPException(status_code=404, detail="Conversation not found")
         
-    # Keep the title but clear messages
     title = conversation.title
     
-    # Delete all messages for this conversation
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("DELETE FROM messages WHERE conversation_id = ?", (conversation_id,))
         conn.commit()
     
-    # Create a new conversation with the same ID
     new_conversation = Conversation(
         id=conversation_id,
         title=title,
@@ -512,7 +585,6 @@ async def reset_conversation(conversation_id: str):
     
     return {"status": "Conversation reset"}
 
-# Endpoint to delete a conversation
 @app.delete("/conversation/{conversation_id}")
 async def delete_conversation_endpoint(conversation_id: str):
     success = delete_conversation(conversation_id)
@@ -520,80 +592,26 @@ async def delete_conversation_endpoint(conversation_id: str):
         return {"status": "Conversation deleted"}
     raise HTTPException(status_code=404, detail="Conversation not found")
 
-# Health check endpoint
 @app.get("/health")
 async def health_check():
     return {
         "status": "ok", 
-        "model_loaded": model is not None,
-        "model_name": "TinyLlama Chat",
+        "regular_model_loaded": model is not None,
+        "rag_model_loaded": rag_model is not None,
+        "rag_available": all([rag_model, embedding_model, faiss_index, text_chunks]),
         "database": os.path.exists(DATABASE_FILE)
     }
 
-# Debug: Get raw prompt endpoint
-@app.get("/debug/prompt/{conversation_id}")
-async def get_raw_prompt(conversation_id: str):
-    """Debug endpoint to see how prompts are being constructed"""
-    conversation = get_conversation_from_db(conversation_id)
-    if not conversation:
-        raise HTTPException(status_code=404, detail="Conversation not found")
-        
-    # Build the prompt the same way as in /ask
-    system_prompt = "<|im_start|>system\nYou are a helpful AI assistant. You provide accurate, helpful and detailed responses.<|im_end|>"
-    
-    conversation_parts = [system_prompt]
-    relevant_history = conversation.messages[-MAX_HISTORY*2:] if len(conversation.messages) else []
-    
-    if relevant_history:
-        for msg in relevant_history:
-            if msg.role == "user":
-                conversation_parts.append(f"<|im_start|>user\n{msg.content}<|im_end|>")
-            else:
-                conversation_parts.append(f"<|im_start|>assistant\n{msg.content}<|im_end|>")
-    
-    conversation_parts.append("<|im_start|>assistant")
-    full_prompt = "\n".join(conversation_parts)
-    
-    return {
-        "raw_prompt": full_prompt,
-        "token_estimate": len(full_prompt) // 4,  # Rough token estimate
-        "message_count": len(conversation.messages)
-    }
-
-# Add an endpoint to see queue status
 @app.get("/status")
 async def status():
     return {
         "queue_size": request_queue.qsize(),
         "active_conversations": len(get_all_conversations()),
-        "model": "TinyLlama-1.1B-Chat",
+        "regular_model": "TinyLlama-1.1B-Chat" if model else "Not loaded",
+        "rag_model": "Mistral-7B-Instruct" if rag_model else "Not loaded",
+        "rag_available": all([rag_model, embedding_model, faiss_index, text_chunks]),
         "database_size": os.path.getsize(DATABASE_FILE) if os.path.exists(DATABASE_FILE) else 0
     }
-
-# Debug database endpoint
-@app.get("/debug/database")
-async def debug_database():
-    """Debug endpoint to check database contents"""
-    with get_db_connection() as conn:
-        cursor = conn.cursor()
-        
-        # Get conversation count
-        cursor.execute("SELECT COUNT(*) as count FROM conversations")
-        conversation_count = cursor.fetchone()['count']
-        
-        # Get message count
-        cursor.execute("SELECT COUNT(*) as count FROM messages")
-        message_count = cursor.fetchone()['count']
-        
-        # Get sample conversations
-        cursor.execute("SELECT id, title FROM conversations LIMIT 5")
-        sample_conversations = [dict(row) for row in cursor.fetchall()]
-        
-        return {
-            "conversation_count": conversation_count,
-            "message_count": message_count,
-            "sample_conversations": sample_conversations
-        }
 
 if __name__ == "__main__":
     import uvicorn

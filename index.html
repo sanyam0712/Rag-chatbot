@@ -210,7 +210,17 @@
                 </div>
             </div>
         </div>
-        
+        <div class="flex items-center justify-end px-6 py-2">
+    <label for="rag-toggle" class="flex items-center cursor-pointer">
+        <span class="mr-2 text-sm text-gray-700">RAG Mode</span>
+        <input type="checkbox" id="rag-toggle" class="hidden">
+        <span class="relative">
+            <span class="block w-10 h-6 bg-gray-300 rounded-full"></span>
+            <span id="rag-toggle-knob" class="absolute left-0 top-0 w-6 h-6 bg-kgtblue rounded-full transition-transform"></span>
+        </span>
+    </label>
+    <span id="rag-mode-label" class="ml-2 text-xs text-gray-500">Off</span>
+</div>
         <div class="input-area">
             <form id="chat-form" class="flex gap-2">
                 <input type="text" id="user-input" placeholder="Type your message..." 
@@ -242,6 +252,20 @@
         let currentConversationId = null;
         let isProcessing = false;
         let currentTitle = "New conversation";
+
+        let useRag = false;
+
+    // Toggle UI logic
+    const ragToggle = document.getElementById('rag-toggle');
+    const ragKnob = document.getElementById('rag-toggle-knob');
+    const ragLabel = document.getElementById('rag-mode-label');
+
+    ragToggle.addEventListener('change', function() {
+        useRag = ragToggle.checked;
+        ragLabel.textContent = useRag ? 'On' : 'Off';
+        ragKnob.style.transform = useRag ? 'translateX(16px)' : 'translateX(0)';
+    });
+
         
         // Function to escape HTML to prevent XSS
         function escapeHtml(text) {
@@ -468,7 +492,8 @@
                     body: JSON.stringify({
                         prompt: message,
                         conversation_id: currentConversationId,
-                        title: currentConversationId ? null : "New conversation" // Only send title for new conversations
+                        title: currentConversationId ? null : "New conversation", // Only send title for new conversations
+                        use_rag: useRag
                     })
                 });
                 
